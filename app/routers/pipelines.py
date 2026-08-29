@@ -528,28 +528,45 @@ def run_node_stream(pipeline_id: int, node_id: int,
             output = "".join(chunks)
             logger.info("OUTPUT (first 800 chars):\n%s\n%s\n", output[:800], "=" * 90)
 
-            node.output_text = output
-            node.status = models.NodeStatus.fresh
-            db.commit()
+            try:
+                node.output_text = output
+                node.status = models.NodeStatus.fresh
+                db.commit()
 
-            stale_ids = _cascade_stale(pipeline, node.order_index, db)
+                stale_ids = _cascade_stale(pipeline, node.order_index, db)
 
-            artifact = models.Artifact(
-                pipeline_id=pipeline.id,
-                node_id=node.id,
-                title=f"{node.agent_id} output",
-                content_md=output,
-            )
-            db.add(artifact)
-            db.commit()
-            db.refresh(node)
+                artifact = models.Artifact(
+                    pipeline_id=pipeline.id,
+                    node_id=node.id,
+                    title=f"{node.agent_id} output",
+                    content_md=output,
+                )
+                db.add(artifact)
+                db.commit()
+                db.refresh(node)
 
-            yield json.dumps({
-                "type": "done",
-                "node": schemas.NodeOut.model_validate(node).model_dump(mode="json"),
-                "stale_node_ids": stale_ids,
-                "artifact_id": artifact.id,
-            }) + "\n"
+                yield json.dumps({
+                    "type": "done",
+                    "node": schemas.NodeOut.model_validate(node).model_dump(mode="json"),
+                    "stale_node_ids": stale_ids,
+                    "artifact_id": artifact.id,
+                }) + "\n"
+            except Exception as e:
+                # The model finished generating fine — this is a failure
+                # saving that output (e.g. a transient SQLite lock under
+                # concurrent polling). Roll back and tell the client
+                # explicitly rather than letting the stream die mid-chunk,
+                # which the browser reports as ERR_INCOMPLETE_CHUNKED_ENCODING
+                # with no useful detail at all.
+                db.rollback()
+                logger.exception(
+                    "[RUN-STREAM SAVE ERROR] pipeline=%s node=%s -> %s",
+                    pipeline_id, node_id, e,
+                )
+                yield json.dumps({
+                    "type": "error",
+                    "message": f"Generated output but failed to save it: {e}",
+                }) + "\n"
         finally:
             db.close()
 
